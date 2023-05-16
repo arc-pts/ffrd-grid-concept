@@ -1,0 +1,11 @@
+name: ffrd-grid-concept
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - dask
+  - rioxarray
+  - jupyterlab
+  - xarray
+  - statsmodels
+  - matplotlib
