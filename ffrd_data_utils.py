@@ -10,8 +10,8 @@ import os
 from typing import List, Optional
 
 
-SAMPLE_WIDTH = 128
-SAMPLE_HEIGHT = 128
+SAMPLE_WIDTH = 1024
+SAMPLE_HEIGHT = 1024
 DISK_CHUNK_WIDTH = 512
 DISK_CHUNK_HEIGHT = 512
 CHUNK_WIDTH = 16
@@ -20,7 +20,8 @@ X1 = 2048
 Y1 = 2048
 X2 = X1 + SAMPLE_WIDTH
 Y2 = Y1 + SAMPLE_HEIGHT
-BOOTSTRAP_SAMPLES = 100
+RESAMPLE_SIZE = 10000
+BOOTSTRAP_SAMPLES = 10
 
 
 def load_terrain(path: str, sample: bool = False) -> xr.DataArray:
@@ -31,33 +32,33 @@ def load_terrain(path: str, sample: bool = False) -> xr.DataArray:
     return da
 
 
-def wsel_tifs_to_zarr2(path: str, zarr_out: str, sample: bool = False):
-    """
-    Load wsel tifs into a zarr dataset. Note that this is not chunked along the r dimension,
-    in order to allow for appending to the dataset.
-    """
-    wsel_tifs = glob(path)
-    wsel_tifs.sort()
+# def wsel_tifs_to_zarr2(path: str, zarr_out: str, sample: bool = False):
+#     """
+#     Load wsel tifs into a zarr dataset. Note that this is not chunked along the r dimension,
+#     in order to allow for appending to the dataset.
+#     """
+#     wsel_tifs = glob(path)
+#     wsel_tifs.sort()
 
-    store = zarr.DirectoryStore(zarr_out)
-    root = zarr.group(store, overwrite=True)
+#     store = zarr.DirectoryStore(zarr_out)
+#     root = zarr.group(store, overwrite=True)
 
-    for r, tif in enumerate(wsel_tifs):
-        print(r, tif)
-        # wsel_da = rioxarray.open_rasterio(tif, chunks=(1, DISK_CHUNK_WIDTH, DISK_CHUNK_HEIGHT), masked=True).squeeze(drop=True)
-        wsel_da = rioxarray.open_rasterio(tif, masked=True).squeeze(drop=True)
-        wsel_da = wsel_da.chunk({"x": DISK_CHUNK_WIDTH, "y": DISK_CHUNK_HEIGHT})
-        wsel_da = wsel_da.expand_dims({"r": [r]})
-        if sample:
-            wsel_da = wsel_da[X1:X2, Y1:Y2]
-        wsel_da.attrs = {}
-        wsel_ds = wsel_da.to_dataset(name="wsel")
-        mode = "w" if r == 0 else "a"
-        append_dim = None if r == 0 else "r"
-        wsel_ds.to_zarr(store=store,
-                        mode=mode,
-                        consolidated=True,
-                        append_dim=append_dim)
+#     for r, tif in enumerate(wsel_tifs):
+#         print(r, tif)
+#         # wsel_da = rioxarray.open_rasterio(tif, chunks=(1, DISK_CHUNK_WIDTH, DISK_CHUNK_HEIGHT), masked=True).squeeze(drop=True)
+#         wsel_da = rioxarray.open_rasterio(tif, masked=True).squeeze(drop=True)
+#         wsel_da = wsel_da.chunk({"x": DISK_CHUNK_WIDTH, "y": DISK_CHUNK_HEIGHT})
+#         wsel_da = wsel_da.expand_dims({"r": [r]})
+#         if sample:
+#             wsel_da = wsel_da[X1:X2, Y1:Y2]
+#         wsel_da.attrs = {}
+#         wsel_ds = wsel_da.to_dataset(name="wsel")
+#         mode = "w" if r == 0 else "a"
+#         append_dim = None if r == 0 else "r"
+#         wsel_ds.to_zarr(store=store,
+#                         mode=mode,
+#                         consolidated=True,
+#                         append_dim=append_dim)
 
 
 def tifs_to_zarr(wsel_tifs_path: str, terrain_tif_path: str, zarr_out: str, sample: bool = False):
@@ -70,13 +71,13 @@ def tifs_to_zarr(wsel_tifs_path: str, terrain_tif_path: str, zarr_out: str, samp
     terrain_ds = terrain_da.to_dataset(name="terrain")
     terrain_ds.to_zarr(store=store, mode="w")
 
-    for r, tif in enumerate(wsel_tifs[:3]):
+    for r, tif in enumerate(wsel_tifs):
         print(r, tif)
         wsel_da = rioxarray.open_rasterio(tif, masked=True).squeeze(drop=True)
-        wsel_da = wsel_da.chunk({"x": DISK_CHUNK_WIDTH, "y": DISK_CHUNK_HEIGHT})
-        wsel_da = wsel_da.expand_dims({"r": [r]})
         if sample:
             wsel_da = wsel_da[X1:X2, Y1:Y2]
+        wsel_da = wsel_da.chunk({"x": DISK_CHUNK_WIDTH, "y": DISK_CHUNK_HEIGHT})
+        wsel_da = wsel_da.expand_dims({"r": [r]})
         wsel_da.attrs = {}
         wsel_ds = wsel_da.to_dataset(name="wsel")
         append_dim = None if r == 0 else "r"
@@ -149,11 +150,16 @@ def depth_da_to_zarr(depth_da: xr.DataArray, zarr_out: str,
     depth_ds.to_zarr(zarr_out, mode="w")
 
 
-def norm_percentile_conf_interval(data: np.ndarray, pct: float, n_samples: int = BOOTSTRAP_SAMPLES, conf_interval = 90):
-    mu, sigma = norm.fit(data)
+def norm_percentile_conf_interval(data: np.ndarray,
+                                  pct: float, n_samples: int = BOOTSTRAP_SAMPLES,
+                                  conf_interval: float = 90,
+                                  weights: Optional[List[float]] = None) -> List[float]:
+    resampled_data = np.random.choice(data, size=RESAMPLE_SIZE, replace=True, p=weights)
+    mu, sigma = norm.fit(resampled_data)
     percentile = norm.ppf(pct, loc=mu, scale=sigma)
 
-    bootstrap_sample = np.random.choice(data, size=(data.shape[0], n_samples), replace=True)
+    bootstrap_sample = np.random.choice(data, size=(data.shape[0], n_samples),
+                                        p=weights, replace=True)
     bootstrap_percentiles = np.apply_along_axis(norm_percentile, 0, bootstrap_sample, pct)
     lower = np.percentile(bootstrap_percentiles, (100 - conf_interval) / 2)
     upper = np.percentile(bootstrap_percentiles, 100 - (100 - conf_interval) / 2)
@@ -173,8 +179,10 @@ def norm_percentile_conf_interval(data: np.ndarray, pct: float, n_samples: int =
 
 
 def depth_quantile(depth: xr.DataArray, aep: float,
-                   spatial_ref: Optional[xr.DataArray] = None) -> xr.Dataset:
+                   spatial_ref: Optional[xr.DataArray] = None,
+                   weights: Optional[List[float]] = None) -> xr.Dataset:
     p = 1 - aep
+    weights_adj = np.array(weights) / np.sum(weights)
     result = da.apply_along_axis(
         norm_percentile_conf_interval,
         0,
@@ -182,6 +190,7 @@ def depth_quantile(depth: xr.DataArray, aep: float,
         p,
         shape=(3, ),
         dtype=np.float32,
+        weights=weights_adj,
     )
     result_da = xr.DataArray(result, dims=["result", "y", "x"],
                              coords={
