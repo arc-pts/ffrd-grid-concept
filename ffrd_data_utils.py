@@ -2,13 +2,15 @@ import dask.array as da
 import numpy as np
 import rioxarray
 import xarray as xr
-from scipy.stats import norm, genextreme
+from scipy.stats import norm, genextreme, rv_continuous
 import zarr
 
 from glob import glob
 import os
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
+
+np.random.seed(42)
 
 SAMPLE_WIDTH = 1024
 SAMPLE_HEIGHT = 1024
@@ -85,7 +87,7 @@ def norm_percentile(data: np.ndarray, p: float):
     return percentile
 
 
-def get_percentiles(data: np.ndarray, pcts: List[float], dist: Callable):
+def get_percentiles(data: np.ndarray, pcts: List[float], dist: rv_continuous):
     params = dist.fit(data)
     return [dist.ppf(p, *params) for p in pcts]
 
@@ -98,15 +100,18 @@ def upper_conf_interval(data: np.ndarray, conf_interval: float = 90) -> float:
     return np.percentile(data, 100 - (100 - conf_interval) / 2)
 
 
-def percentile_conf_interval(data: np.ndarray, pcts: List[float], dist: Callable,
+def percentile_conf_interval(data: np.ndarray, pcts: List[float], dist: rv_continuous,
                              conf_interval: float = 90, n_samples: int = BOOTSTRAP_SAMPLES,
                              weights: Optional[List[float]] = None) -> List[float]:
     resampled_data = np.random.choice(data, size=RESAMPLE_SIZE, replace=True, p=weights)
-    percentiles = get_percentiles(resampled_data, pcts, dist)
+    # percentiles = get_percentiles(resampled_data, pcts, dist)
+    percentiles = zero_inflated_percentiles(resampled_data, pcts, dist)
 
-    bootstrap_sample = np.random.choice(data, size=(data.shape[0], n_samples),
+    # bootstrap_sample = np.random.choice(data, size=(data.shape[0], n_samples),
+    bootstrap_sample = np.random.choice(data, size=(RESAMPLE_SIZE, n_samples),
                                         p=weights, replace=True)
-    bootstrap_percentiles = np.apply_along_axis(get_percentiles, 0, bootstrap_sample, pcts, dist)
+    # bootstrap_percentiles = np.apply_along_axis(get_percentiles, 0, bootstrap_sample, pcts, dist)
+    bootstrap_percentiles = np.apply_along_axis(zero_inflated_percentiles, 0, bootstrap_sample, pcts, dist)
     lower = np.apply_along_axis(lower_conf_interval, 1, bootstrap_percentiles, conf_interval)
     upper = np.apply_along_axis(upper_conf_interval, 1, bootstrap_percentiles, conf_interval)
     return [percentiles, lower, upper]
@@ -122,14 +127,14 @@ def depth_quantiles(depth: xr.DataArray, aeps: List[float],
         0,
         depth,
         probs,
-        genextreme,
+        norm,
         shape=(3, len(probs)),
         dtype=np.float32,
         weights=weights_adj,
     )
-    result_da = xr.DataArray(result, dims=["result", "y", "x", "aep"],
+    result_da = xr.DataArray(result, dims=["result", "aep", "y", "x"],
                                 coords={
-                                    "result": ["percentile", "lower_ci", "upper_ci"],
+                                    "result": ["depth", "lower_ci", "upper_ci"],
                                     "y": depth.y,
                                     "x": depth.x,
                                     "aep": aeps,
@@ -181,3 +186,34 @@ def depth_quantile(depth: xr.DataArray, aep: float,
     if spatial_ref is not None:
         dataset["spatial_ref"] = spatial_ref
     return dataset
+
+
+def zero_inflated_percentiles(data: np.ndarray, pcts: List[float],
+                              dist: rv_continuous = genextreme) -> List[float]:
+    """
+    Calculate the flood depth percentiles for a given list of AEP values. 
+    """
+    # Calculate the portion of non-zero values
+    prob_zero = np.sum(data == 0.0) / data.size
+
+    if not any(pct > prob_zero for pct in pcts):
+        # If all of the percentiles are below the portion of non-zero values,
+        # then all results are 0.0
+        return [0.0] * len(pcts)
+
+    idx_nonzero = np.where(data > 0)
+    data_nonzero = data[idx_nonzero]
+    params = dist.fit(data_nonzero)
+
+    results = []
+    for pct in pcts:
+        if pct > prob_zero:
+            # Calculate the percentile of the non-zero values
+            pct_nonzero = (pct - prob_zero) / (1.0 - prob_zero)
+            result = dist.ppf(pct_nonzero, *params)
+            result = 0.0 if result < 0.0 else result  # Ensure result is not negative
+            results.append(result)
+        else:
+            results.append(0.0)
+    return results
+
