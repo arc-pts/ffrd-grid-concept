@@ -13,6 +13,7 @@ from typing import Callable, List, Optional, Tuple
 np.random.seed(42)
 
 # Chunk size for working with initial raster data.
+# TIFF data seems to load faster with larger chunk sizes.
 INITIAL_CHUNK_WIDTH = 512
 INITIAL_CHUNK_HEIGHT = 512
 
@@ -95,7 +96,8 @@ def tifs_to_zarr(wsel_tifs_path: str, terrain_tif_path: str, zarr_out: str, samp
 
 def rechunk_wsel_zarr(zarr_in: str, zarr_out: str):
     """
-    Rechunk the WSEL Zarr dataset to a smaller chunk size.
+    Rechunk the WSEL Zarr dataset by combining all chunks along the "r" axis.
+    Chunk size along the "x" and "y" axis is maintained.
     
     Args:
         zarr_in: Path to the input Zarr dataset.
@@ -221,8 +223,8 @@ def percentile_conf_interval(data: np.ndarray, pcts: List[float], dist: rv_conti
                                                                              List[float],
                                                                              List[float]]:
     """
-    Calculate the flood depth percentiles for a given list of AEP values.
-    Also calculate the confidence intervals for the percentiles using bootstrapping.
+    Calculate the flood depth percentiles and confidence intervals for a given list
+    of AEP values using bootstrapping.
     
     Args:
         data: The array of flood depth values at a single location.
@@ -236,18 +238,16 @@ def percentile_conf_interval(data: np.ndarray, pcts: List[float], dist: rv_conti
         The estimated flood depths for the given percentiles, along with the
         lower and upper confidence intervals.
     """
-    # estimate flood depths for the given percentiles by resampling the data
-    resampled_data = np.random.choice(data, size=RESAMPLE_SIZE, replace=True, p=weights)
-    percentiles = zero_inflated_percentiles(resampled_data, pcts, dist)
-
-    # estimate confidence intervals creating n_samples bootstrap samples
-    # of size RESAMPLE_SIZE
+    # create n_samples bootstrap samples of size RESAMPLE_SIZE
     bootstrap_sample = np.random.choice(data, size=(RESAMPLE_SIZE, n_samples),
                                         p=weights, replace=True)
 
-    # calculate the percentiles for each bootstrap sample
+    # estimate percentile values for each bootstrap sample
     bootstrap_percentiles = np.apply_along_axis(zero_inflated_percentiles, 0,
                                                 bootstrap_sample, pcts, dist)
+
+    # calculate the mean percentile values across all bootstrap samples
+    percentiles = np.mean(bootstrap_percentiles, axis=1)
 
     # calculate the lower and upper confidence intervals for each percentile
     lower = np.apply_along_axis(lower_conf_interval, 1, bootstrap_percentiles, conf_interval)
@@ -284,13 +284,14 @@ def depth_quantiles(depth: xr.DataArray, aeps: List[float],
         dtype=np.float32,
         weights=weights_adj,
     )
-    result_da = xr.DataArray(result, dims=["result", "aep", "y", "x"],
-                                coords={
-                                    "result": ["depth", "lower_ci", "upper_ci"],
-                                    "y": depth.y,
-                                    "x": depth.x,
-                                    "aep": aeps,
-                                },
+    result_da = xr.DataArray(result,
+                             dims=["result", "aep", "y", "x"],
+                             coords={
+                                 "result": ["depth", "lower_ci", "upper_ci"],
+                                 "y": depth.y,
+                                 "x": depth.x,
+                                 "aep": aeps,
+                             },
     )
     dataset = result_da.to_dataset(dim="result")
     if spatial_ref is not None:
