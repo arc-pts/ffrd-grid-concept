@@ -22,7 +22,7 @@ CHUNK_WIDTH = 16
 CHUNK_HEIGHT = 16
 
 # Size and location of the raster data to sample from.
-# Helpful for dev/testing, since the full dataset is pretty large.
+# Helpful for dev/testing, since the full dataset takes a while to analyze.
 SAMPLE_HEIGHT = 1024
 SAMPLE_WIDTH = 1024
 X1 = 2048
@@ -35,6 +35,9 @@ RESAMPLE_SIZE = 10000
 
 # Number of bootstrap samples to create for estimating confidence intervals
 BOOTSTRAP_SAMPLES = 10
+
+# Distribution to use for estimating percentiles
+DISTRIBUTION = norm
 
 
 def load_terrain(path: str, sample: bool = False) -> xr.DataArray:
@@ -138,17 +141,6 @@ def depth_da_to_zarr(depth_da: xr.DataArray, zarr_out: str,
     depth_ds.to_zarr(zarr_out, mode="w")
 
 
-# def norm_percentile(data: np.ndarray, p: float):
-#     mu, sigma = norm.fit(data)
-#     percentile = norm.ppf(p, loc=mu, scale=sigma)
-#     return percentile
-
-
-# def get_percentiles(data: np.ndarray, pcts: List[float], dist: rv_continuous):
-#     params = dist.fit(data)
-#     return [dist.ppf(p, *params) for p in pcts]
-
-
 def lower_conf_interval(data: np.ndarray, conf_interval: float = 90) -> float:
     """
     Calculate the lower confidence interval for a given array of values.
@@ -180,12 +172,20 @@ def upper_conf_interval(data: np.ndarray, conf_interval: float = 90) -> float:
 def zero_inflated_percentiles(data: np.ndarray, pcts: List[float],
                               dist: rv_continuous) -> List[float]:
     """
-    Calculate the flood depth percentiles for a given list of AEP values. 
+    Calculate the flood depth percentiles at a single location for a given array
+    of flood depths and a list of percentiles.
+    
+    If the percentile in "pcts" is below the portion of non-zero values in "data",
+    then the result is 0.0 Otherwise, result is calculated using the non-zero values.
+
+    For example, if 73% of the values in "data" are 0.0, then the 0.5 percentile
+    will be 0.0, since 0.5 is below 73%. The 0.9 percentile will be calculated by 
+    fitting a distribution to the 27% of values in "data" which are not 0.0.
 
     Args:
         data: The array of flood depth values at a single location.
         pcts: The list of percentile values to estimate (0.0 to 1.0).
-        dist: The distribution to use for estimating the percentiles.
+        dist: The distribution to use for estimating non-zero percentiles.
 
     Returns:
         The estimated flood depths for the given percentiles.
@@ -217,7 +217,9 @@ def zero_inflated_percentiles(data: np.ndarray, pcts: List[float],
 
 def percentile_conf_interval(data: np.ndarray, pcts: List[float], dist: rv_continuous,
                              conf_interval: float = 90, n_samples: int = BOOTSTRAP_SAMPLES,
-                             weights: Optional[List[float]] = None) -> Tuple[List[float], List[float], List[float]]:
+                             weights: Optional[List[float]] = None) -> Tuple[List[float],
+                                                                             List[float],
+                                                                             List[float]]:
     """
     Calculate the flood depth percentiles for a given list of AEP values.
     Also calculate the confidence intervals for the percentiles using bootstrapping.
@@ -234,13 +236,20 @@ def percentile_conf_interval(data: np.ndarray, pcts: List[float], dist: rv_conti
         The estimated flood depths for the given percentiles, along with the
         lower and upper confidence intervals.
     """
+    # estimate flood depths for the given percentiles by resampling the data
     resampled_data = np.random.choice(data, size=RESAMPLE_SIZE, replace=True, p=weights)
     percentiles = zero_inflated_percentiles(resampled_data, pcts, dist)
 
+    # estimate confidence intervals creating n_samples bootstrap samples
+    # of size RESAMPLE_SIZE
     bootstrap_sample = np.random.choice(data, size=(RESAMPLE_SIZE, n_samples),
                                         p=weights, replace=True)
+
+    # calculate the percentiles for each bootstrap sample
     bootstrap_percentiles = np.apply_along_axis(zero_inflated_percentiles, 0,
                                                 bootstrap_sample, pcts, dist)
+
+    # calculate the lower and upper confidence intervals for each percentile
     lower = np.apply_along_axis(lower_conf_interval, 1, bootstrap_percentiles, conf_interval)
     upper = np.apply_along_axis(upper_conf_interval, 1, bootstrap_percentiles, conf_interval)
     return percentiles, lower, upper
@@ -270,7 +279,7 @@ def depth_quantiles(depth: xr.DataArray, aeps: List[float],
         0,
         depth,
         probs,
-        norm,
+        DISTRIBUTION,
         shape=(3, len(probs)),
         dtype=np.float32,
         weights=weights_adj,
@@ -287,46 +296,3 @@ def depth_quantiles(depth: xr.DataArray, aeps: List[float],
     if spatial_ref is not None:
         dataset["spatial_ref"] = spatial_ref
     return dataset
-
-
-# def norm_percentile_conf_interval(data: np.ndarray,
-#                                   pct: float, n_samples: int = BOOTSTRAP_SAMPLES,
-#                                   conf_interval: float = 90,
-#                                   weights: Optional[List[float]] = None) -> List[float]:
-#     resampled_data = np.random.choice(data, size=RESAMPLE_SIZE, replace=True, p=weights)
-#     percentile = norm_percentile(resampled_data, pct)
-
-#     bootstrap_sample = np.random.choice(data, size=(data.shape[0], n_samples),
-#                                         p=weights, replace=True)
-#     bootstrap_percentiles = np.apply_along_axis(norm_percentile, 0, bootstrap_sample, pct)
-#     lower = np.percentile(bootstrap_percentiles, (100 - conf_interval) / 2)
-#     upper = np.percentile(bootstrap_percentiles, 100 - (100 - conf_interval) / 2)
-#     return [percentile, lower, upper]
-
-
-# def depth_quantile(depth: xr.DataArray, aep: float,
-#                    spatial_ref: Optional[xr.DataArray] = None,
-#                    weights: Optional[List[float]] = None) -> xr.Dataset:
-#     p = 1 - aep
-#     weights_adj = np.array(weights) / np.sum(weights)
-#     result = da.apply_along_axis(
-#         norm_percentile_conf_interval,
-#         0,
-#         depth,
-#         p,
-#         shape=(3, ),
-#         dtype=np.float32,
-#         weights=weights_adj,
-#     )
-#     result_da = xr.DataArray(result, dims=["result", "y", "x"],
-#                              coords={
-#                                  "result": ["depth", "lower_ci", "upper_ci"],
-#                                  "y": depth.y,
-#                                  "x": depth.x,
-#                             },
-#     )
-#     dataset = result_da.to_dataset(dim="result")
-#     if spatial_ref is not None:
-#         dataset["spatial_ref"] = spatial_ref
-#     return dataset
-
