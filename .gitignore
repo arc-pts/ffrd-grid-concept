@@ -1,6 +1,6 @@
 dask-worker-space/
 data/*
-!data/.gitkeep
+!data/Addison_M03_H04_Weights.json
 
 
 # Byte-compiled / optimized / DLL files
