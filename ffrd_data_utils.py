@@ -32,7 +32,7 @@ X2 = X1 + SAMPLE_WIDTH
 Y2 = Y1 + SAMPLE_HEIGHT
 
 # Number of samples to draw from the weighted raster data for bootsrapping
-RESAMPLE_SIZE = 10000
+RESAMPLE_SIZE = 1000
 
 # Number of bootstrap samples to create for estimating confidence intervals
 BOOTSTRAP_SAMPLES = 10
@@ -219,9 +219,10 @@ def zero_inflated_percentiles(data: np.ndarray, pcts: List[float],
 
 def percentile_conf_interval(data: np.ndarray, pcts: List[float], dist: rv_continuous,
                              conf_interval: float = 90, n_samples: int = BOOTSTRAP_SAMPLES,
-                             weights: Optional[List[float]] = None) -> Tuple[List[float],
-                                                                             List[float],
-                                                                             List[float]]:
+                             weights: Optional[List[float]] = None,
+                             normalize: Optional[bool] = False) -> Tuple[List[float],
+                                                                   List[float],
+                                                                   List[float]]:
     """
     Calculate the flood depth percentiles and confidence intervals for a given list
     of AEP values using bootstrapping.
@@ -238,6 +239,11 @@ def percentile_conf_interval(data: np.ndarray, pcts: List[float], dist: rv_conti
         The estimated flood depths for the given percentiles, along with the
         lower and upper confidence intervals.
     """
+    # normalize the data to set the minimum value to 0.0
+    if normalize:
+        data_min = np.min(data)
+        data = data - data_min
+
     # create n_samples bootstrap samples of size RESAMPLE_SIZE
     bootstrap_sample = np.random.choice(data, size=(RESAMPLE_SIZE, n_samples),
                                         p=weights, replace=True)
@@ -252,6 +258,8 @@ def percentile_conf_interval(data: np.ndarray, pcts: List[float], dist: rv_conti
     # calculate the lower and upper confidence intervals for each percentile
     lower = np.apply_along_axis(lower_conf_interval, 1, bootstrap_percentiles, conf_interval)
     upper = np.apply_along_axis(upper_conf_interval, 1, bootstrap_percentiles, conf_interval)
+    if normalize:
+        return percentiles + data_min, lower + data_min, upper + data_min
     return percentiles, lower, upper
 
 
@@ -296,4 +304,46 @@ def depth_quantiles(depth: xr.DataArray, aeps: List[float],
     dataset = result_da.to_dataset(dim="result")
     if spatial_ref is not None:
         dataset["spatial_ref"] = spatial_ref
+    return dataset
+
+
+def wsel_quantiles(wsel: xr.DataArray, aeps: List[float],
+                   weights: Optional[List[float]] = None,
+                   normalize: Optional[bool] = True) -> xr.Dataset:
+    """
+    Calculate the flood depth percentiles for a given list of AEP values.
+    Also calculate the confidence intervals for the percentiles using bootstrapping.
+    
+    Args:
+        depth: The depth of flooding data.
+        aeps: The list of AEP values to estimate (0.0 to 1.0).
+        spatial_ref: The spatial reference data.
+        weights: The weights to use for sampling the data.
+        
+    Returns:
+        The estimated flood depths for the given AEP values, along with the
+        lower and upper confidence intervals, as an xarray Dataset.
+    """
+    probs = [1 - aep for aep in aeps]
+    weights_adj = np.array(weights) / np.sum(weights)
+    result = da.apply_along_axis(
+        percentile_conf_interval,
+        0,
+        wsel,
+        probs,
+        DISTRIBUTION,
+        shape=(3, len(probs)),
+        dtype=np.float32,
+        weights=weights_adj,
+        normalize=normalize,
+    )
+    result_da = xr.DataArray(result,
+                             dims=["result", "aep", "index"],
+                             coords={
+                                 "result": ["wsel", "lower_ci", "upper_ci"],
+                                 "aep": aeps,
+                                 "index": wsel.index,
+                             },
+    )
+    dataset = result_da.to_dataset(dim="result")
     return dataset
