@@ -9,3 +9,7 @@ dependencies:
   - xarray
   - statsmodels
   - matplotlib
+  - zarr
+  - h5py
+  - geopandas
+  - tqdm
